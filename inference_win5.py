@@ -685,18 +685,27 @@ def build_race_result_lookup(scored_dataframe: pd.DataFrame) -> dict[str, dict[s
             implied_probabilities = 1.0 / market_win_odds.clip(lower=1.01)
             total_implied_probability = implied_probabilities.sum()
             market_support = implied_probabilities / total_implied_probability if total_implied_probability > 0 else pd.Series(0.0, index=sorted_frame.index)
+            market_rank = market_win_odds.rank(method="first", ascending=True, na_option="bottom")
             favorites = sorted_frame.assign(
                 market_win_odds=market_win_odds,
                 market_support=market_support,
+                market_rank=market_rank,
             ).sort_values(["market_win_odds", "predicted_rank"], ascending=[True, True])
             favorite_odds = float(favorites["market_win_odds"].iloc[0])
             favorite_support = float(favorites["market_support"].iloc[0])
             top3_market_support = float(favorites["market_support"].head(3).sum())
+            top2_odds = favorites["market_win_odds"].head(2).tolist()
+            top5_odds = favorites["market_win_odds"].head(5)
+            top2_market_odds_ratio = float(top2_odds[1] / max(top2_odds[0], 0.1)) if len(top2_odds) >= 2 else float("nan")
+            top5_market_odds_variance = float(top5_odds.var(ddof=0)) if len(top5_odds) >= 2 else 0.0
         else:
             market_support = pd.Series(0.0, index=sorted_frame.index)
+            market_rank = pd.Series(index=sorted_frame.index, dtype="float64")
             favorite_odds = float("nan")
             favorite_support = 0.0
             top3_market_support = 0.0
+            top2_market_odds_ratio = float("nan")
+            top5_market_odds_variance = 0.0
 
         winner = winners.iloc[0]
         lookup[str(race_id)] = {
@@ -706,15 +715,145 @@ def build_race_result_lookup(scored_dataframe: pd.DataFrame) -> dict[str, dict[s
             "top_horses": sorted_frame.assign(
                 market_win_odds=market_win_odds,
                 market_support=market_support,
-            )[["uma_ban", "predicted_win_probability", "predicted_rank", "market_win_odds", "market_support"]].copy(),
+                market_rank=market_rank,
+            )[["uma_ban", "predicted_win_probability", "predicted_rank", "market_win_odds", "market_support", "market_rank"]].copy(),
             "race_num": int(sorted_frame["race_num"].iloc[0]),
             "jyo_cd": str(sorted_frame["jyo_cd"].iloc[0]),
             "hasso_time": str(sorted_frame.get("hasso_time", pd.Series([""])).iloc[0]),
             "favorite_odds": favorite_odds,
             "favorite_support": favorite_support,
             "top3_market_support": top3_market_support,
+            "top2_market_odds_ratio": top2_market_odds_ratio,
+            "top5_market_odds_variance": top5_market_odds_variance,
         }
     return lookup
+
+
+def add_pattern_shape_features(
+    daily_dataframe: pd.DataFrame,
+    dense_odds_variance_threshold: float | None,
+    cliff_odds_ratio_threshold: float | None,
+) -> pd.DataFrame:
+    if daily_dataframe.empty:
+        return daily_dataframe.copy()
+
+    enriched = daily_dataframe.copy()
+    enriched["wide_leg_count"] = 0
+    enriched["single_leg_count"] = 0
+    enriched["dense_leg_count"] = 0
+    enriched["cliff_leg_count"] = 0
+    enriched["dense_wide_leg_count"] = 0
+    enriched["wide_leg_outside_dense_count"] = 0
+
+    for leg_index in range(1, 6):
+        top_n_column = f"leg{leg_index}_top_n"
+        odds_ratio_column = f"leg{leg_index}_top2_odds_ratio"
+        odds_variance_column = f"leg{leg_index}_top5_odds_variance"
+        if top_n_column not in enriched.columns:
+            continue
+
+        top_n_values = pd.to_numeric(enriched[top_n_column], errors="coerce").fillna(0)
+        wide_mask = top_n_values >= 3
+        single_mask = top_n_values <= 1
+        dense_mask = pd.Series(False, index=enriched.index)
+        cliff_mask = pd.Series(False, index=enriched.index)
+
+        if dense_odds_variance_threshold is not None and odds_variance_column in enriched.columns:
+            odds_variance_values = pd.to_numeric(enriched[odds_variance_column], errors="coerce")
+            dense_mask = odds_variance_values <= float(dense_odds_variance_threshold)
+        if cliff_odds_ratio_threshold is not None and odds_ratio_column in enriched.columns:
+            odds_ratio_values = pd.to_numeric(enriched[odds_ratio_column], errors="coerce")
+            cliff_mask = odds_ratio_values >= float(cliff_odds_ratio_threshold)
+
+        enriched["wide_leg_count"] += wide_mask.astype(int)
+        enriched["single_leg_count"] += single_mask.astype(int)
+        enriched["dense_leg_count"] += dense_mask.astype(int)
+        enriched["cliff_leg_count"] += cliff_mask.astype(int)
+        enriched["dense_wide_leg_count"] += (wide_mask & dense_mask).astype(int)
+        enriched["wide_leg_outside_dense_count"] += (wide_mask & ~dense_mask).astype(int)
+
+    return enriched
+
+
+def filter_auto_select_candidates(
+    eligible: pd.DataFrame,
+    min_ticket_count: int | None,
+    max_ticket_count: int | None,
+    min_wide_legs: int | None,
+    max_wide_legs: int | None,
+    min_single_legs: int | None,
+    max_leg_top_n: int | None,
+    require_wide_legs_on_dense: bool,
+) -> pd.DataFrame:
+    if eligible.empty:
+        return eligible
+
+    filtered = eligible.copy()
+    if min_ticket_count is not None:
+        filtered = filtered.loc[pd.to_numeric(filtered["ticket_count"], errors="coerce") >= int(min_ticket_count)].copy()
+    if max_ticket_count is not None:
+        filtered = filtered.loc[pd.to_numeric(filtered["ticket_count"], errors="coerce") <= int(max_ticket_count)].copy()
+    if min_wide_legs is not None and "wide_leg_count" in filtered.columns:
+        filtered = filtered.loc[pd.to_numeric(filtered["wide_leg_count"], errors="coerce") >= int(min_wide_legs)].copy()
+    if max_wide_legs is not None and "wide_leg_count" in filtered.columns:
+        filtered = filtered.loc[pd.to_numeric(filtered["wide_leg_count"], errors="coerce") <= int(max_wide_legs)].copy()
+    if min_single_legs is not None and "single_leg_count" in filtered.columns:
+        filtered = filtered.loc[pd.to_numeric(filtered["single_leg_count"], errors="coerce") >= int(min_single_legs)].copy()
+    if max_leg_top_n is not None:
+        leg_top_n_columns = [column for column in filtered.columns if column.startswith("leg") and column.endswith("_top_n")]
+        if leg_top_n_columns:
+            top_n_max = filtered[leg_top_n_columns].apply(pd.to_numeric, errors="coerce").max(axis=1)
+            filtered = filtered.loc[top_n_max <= int(max_leg_top_n)].copy()
+    if require_wide_legs_on_dense and "wide_leg_outside_dense_count" in filtered.columns:
+        filtered = filtered.loc[pd.to_numeric(filtered["wide_leg_outside_dense_count"], errors="coerce") <= 0].copy()
+    return filtered
+
+
+def add_rule_based_priority_features(daily_dataframe: pd.DataFrame) -> pd.DataFrame:
+    if daily_dataframe.empty:
+        return daily_dataframe.copy()
+
+    enriched = daily_dataframe.copy()
+    enriched["densest_leg_index"] = 0
+    enriched["densest_leg_top_n"] = 0
+    enriched["density_sorted_topn_key"] = ""
+
+    for density_rank in range(1, 6):
+        enriched[f"density_rank_{density_rank}_leg_index"] = 0
+        enriched[f"density_rank_{density_rank}_top_n"] = 0
+
+    for row_index, row in enriched.iterrows():
+        leg_descriptors: list[tuple[float, float, int, int]] = []
+        for leg_index in range(1, 6):
+            top_n_column = f"leg{leg_index}_top_n"
+            odds_variance_column = f"leg{leg_index}_top5_odds_variance"
+            odds_ratio_column = f"leg{leg_index}_top2_odds_ratio"
+            if top_n_column not in enriched.columns:
+                continue
+
+            top_n_value = pd.to_numeric(pd.Series([row.get(top_n_column)]), errors="coerce").iloc[0]
+            odds_variance_value = pd.to_numeric(pd.Series([row.get(odds_variance_column)]), errors="coerce").iloc[0]
+            odds_ratio_value = pd.to_numeric(pd.Series([row.get(odds_ratio_column)]), errors="coerce").iloc[0]
+
+            variance_sort_value = float(odds_variance_value) if pd.notna(odds_variance_value) else float("inf")
+            ratio_sort_value = float(odds_ratio_value) if pd.notna(odds_ratio_value) else float("-inf")
+            top_n_sort_value = int(top_n_value) if pd.notna(top_n_value) else 0
+            leg_descriptors.append((variance_sort_value, -ratio_sort_value, leg_index, top_n_sort_value))
+
+        leg_descriptors.sort()
+        if not leg_descriptors:
+            continue
+
+        densest_leg = leg_descriptors[0]
+        enriched.at[row_index, "densest_leg_index"] = int(densest_leg[2])
+        enriched.at[row_index, "densest_leg_top_n"] = int(densest_leg[3])
+        enriched.at[row_index, "density_sorted_topn_key"] = "-".join(str(int(item[3])) for item in leg_descriptors)
+
+        for density_rank, descriptor in enumerate(leg_descriptors[:5], start=1):
+            enriched.at[row_index, f"density_rank_{density_rank}_leg_index"] = int(descriptor[2])
+            enriched.at[row_index, f"density_rank_{density_rank}_top_n"] = int(descriptor[3])
+
+    return enriched
 
 
 def apply_favorite_side_payout_brake(
@@ -786,11 +925,14 @@ def resolve_dynamic_topn(
 def build_candidate_legs(
     race_results: list[dict[str, object]],
     topn_pattern: tuple[int, ...],
- ) -> tuple[list[list[tuple[str, float]]], tuple[str, ...]]:
+    max_market_rank: int | None,
+) -> tuple[list[list[tuple[str, float]]], tuple[str, ...]]:
     candidate_legs: list[list[tuple[str, float]]] = []
     winner_combination: list[str] = []
     for race_result, top_n in zip(race_results, topn_pattern):
-        top_horses = race_result["top_horses"].head(top_n)
+        top_horses = race_result["top_horses"].head(top_n).copy()
+        if max_market_rank is not None:
+            top_horses = top_horses.loc[top_horses["market_rank"].fillna(float("inf")) <= float(max_market_rank)].copy()
         leg_candidates = [
             (str(row.uma_ban), float(row.predicted_win_probability))
             for row in top_horses.itertuples(index=False)
@@ -808,8 +950,13 @@ def compute_selected_combinations(
     topn_pattern: tuple[int, ...],
     probability_threshold: float,
     max_ticket_count: int | None,
+    max_market_rank: int | None,
 ) -> dict[str, object]:
-    candidate_legs, winner_combination = build_candidate_legs(race_results=race_results, topn_pattern=topn_pattern)
+    candidate_legs, winner_combination = build_candidate_legs(
+        race_results=race_results,
+        topn_pattern=topn_pattern,
+        max_market_rank=max_market_rank,
+    )
     if not candidate_legs:
         return {
             "ticket_count": 0,
@@ -866,6 +1013,7 @@ def summarize_win5_pattern(
     ticket_unit: int,
     probability_threshold: float,
     max_bet_amount: int | None,
+    max_market_rank: int | None,
     dynamic_topn_enabled: bool,
     dynamic_topn_threshold: float,
     dynamic_topn_max: int,
@@ -929,6 +1077,8 @@ def summarize_win5_pattern(
             day_record[f"leg{leg_index}_top_n"] = int(effective_top_n)
             day_record[f"leg{leg_index}_dynamic_expanded"] = int(effective_top_n > top_n)
             day_record[f"leg{leg_index}_probability_gap"] = float(probability_gap)
+            day_record[f"leg{leg_index}_top2_odds_ratio"] = float(race_result.get("top2_market_odds_ratio", float("nan")))
+            day_record[f"leg{leg_index}_top5_odds_variance"] = float(race_result.get("top5_market_odds_variance", 0.0))
             day_record[f"leg{leg_index}_picked"] = picked_horses
             day_record[f"leg{leg_index}_winner"] = str(race_result["winner_uma_ban"])
             day_record[f"leg{leg_index}_winner_rank"] = int(race_result["winner_rank"])
@@ -939,6 +1089,7 @@ def summarize_win5_pattern(
             topn_pattern=tuple(effective_topn_pattern),
             probability_threshold=probability_threshold,
             max_ticket_count=max_ticket_count,
+            max_market_rank=max_market_rank,
         )
         ticket_count = int(combination_result["ticket_count"])
         raw_ticket_count = int(combination_result["raw_ticket_count"])
@@ -952,6 +1103,7 @@ def summarize_win5_pattern(
         day_record["estimated_payout_yen"] = float(estimated_payout_yen)
         day_record["probability_threshold"] = float(probability_threshold)
         day_record["max_bet_amount"] = int(max_bet_amount) if max_bet_amount is not None else 0
+        day_record["max_market_rank"] = int(max_market_rank) if max_market_rank is not None else 0
         day_record["budget_ticket_limit"] = int(combination_result["budget_ticket_limit"])
         day_record["raw_ticket_count"] = raw_ticket_count
         day_record["budget_capped"] = int(bool(combination_result["budget_capped"]))
@@ -971,6 +1123,7 @@ def summarize_win5_pattern(
         "pattern": "-".join(str(value) for value in topn_pattern),
         "probability_threshold": float(probability_threshold),
         "max_bet_amount": float(max_bet_amount) if max_bet_amount is not None else 0.0,
+        "max_market_rank": float(max_market_rank) if max_market_rank is not None else 0.0,
         "day_count": float(total_days),
         "win5_hit_count": float(all_hit_days),
         "win5_hit_rate": all_hit_days / total_days if total_days else 0.0,
@@ -999,6 +1152,7 @@ def evaluate_win5_patterns(
     buy_expected_value_source: str,
     max_probability_sum: float | None,
     max_bet_amount: int | None,
+    max_market_rank: int | None,
     dynamic_topn_enabled: bool,
     dynamic_topn_threshold: float,
     dynamic_topn_max: int,
@@ -1025,6 +1179,7 @@ def evaluate_win5_patterns(
                 ticket_unit=ticket_unit,
                 probability_threshold=probability_threshold,
                 max_bet_amount=max_bet_amount,
+                max_market_rank=max_market_rank,
                 dynamic_topn_enabled=dynamic_topn_enabled,
                 dynamic_topn_threshold=dynamic_topn_threshold,
                 dynamic_topn_max=dynamic_topn_max,
@@ -1062,6 +1217,19 @@ def evaluate_win5_patterns(
 
 def build_auto_selected_daily_patterns(
     daily_results: dict[str, pd.DataFrame],
+    selection_mode: str,
+    score_mode: str,
+    log_offset: float,
+    top_probability_fraction: float,
+    dense_odds_variance_threshold: float | None,
+    cliff_odds_ratio_threshold: float | None,
+    min_ticket_count: int | None,
+    max_ticket_count: int | None,
+    min_wide_legs: int | None,
+    max_wide_legs: int | None,
+    min_single_legs: int | None,
+    max_leg_top_n: int | None,
+    require_wide_legs_on_dense: bool,
 ) -> pd.DataFrame:
     daily_frames: list[pd.DataFrame] = []
     for result_key, daily_dataframe in daily_results.items():
@@ -1073,7 +1241,34 @@ def build_auto_selected_daily_patterns(
         enriched_daily["pattern"] = pattern
         enriched_daily["probability_threshold"] = float(probability_threshold_text)
         enriched_daily["min_expected_value"] = float(min_expected_value_text)
-        enriched_daily["auto_select_score"] = enriched_daily["expected_return_yen"]
+        enriched_daily = add_pattern_shape_features(
+            daily_dataframe=enriched_daily,
+            dense_odds_variance_threshold=dense_odds_variance_threshold,
+            cliff_odds_ratio_threshold=cliff_odds_ratio_threshold,
+        )
+        if score_mode == "expected_return":
+            enriched_daily["auto_select_score"] = enriched_daily["expected_return_yen"]
+        elif score_mode == "expected_return_per_ticket":
+            enriched_daily["auto_select_score"] = 0.0
+            positive_ticket_count = enriched_daily["ticket_count"] > 0
+            enriched_daily.loc[positive_ticket_count, "auto_select_score"] = (
+                enriched_daily.loc[positive_ticket_count, "expected_return_yen"]
+                / enriched_daily.loc[positive_ticket_count, "ticket_count"]
+            )
+        elif score_mode == "expected_return_log_ticket_penalty":
+            if log_offset <= 0.0:
+                raise ValueError("auto_select_log_offset は 0 より大きい必要があります")
+            enriched_daily["auto_select_score"] = 0.0
+            positive_ticket_count = enriched_daily["ticket_count"] > 0
+            denominators = (enriched_daily.loc[positive_ticket_count, "ticket_count"] + float(log_offset)).map(math.log10)
+            valid_denominator = denominators > 0.0
+            if valid_denominator.any():
+                valid_index = denominators.index[valid_denominator]
+                enriched_daily.loc[valid_index, "auto_select_score"] = (
+                    enriched_daily.loc[valid_index, "expected_return_yen"] / denominators.loc[valid_index]
+                )
+        else:
+            raise ValueError(f"未対応の auto_select_score_mode です: {score_mode}")
         daily_frames.append(enriched_daily)
 
     if not daily_frames:
@@ -1087,16 +1282,69 @@ def build_auto_selected_daily_patterns(
         eligible = day_frame.loc[day_frame["buy_flag"] == 1].copy()
         if eligible.empty:
             eligible = day_frame.copy()
-        eligible = eligible.sort_values(
-            [
-                "auto_select_score",
-                "buy_flag",
-                "expected_value_ratio",
-                "selected_probability_sum",
-                "cost_yen",
-            ],
-            ascending=[False, False, False, False, True],
+
+        constrained = filter_auto_select_candidates(
+            eligible=eligible,
+            min_ticket_count=min_ticket_count,
+            max_ticket_count=max_ticket_count,
+            min_wide_legs=min_wide_legs,
+            max_wide_legs=max_wide_legs,
+            min_single_legs=min_single_legs,
+            max_leg_top_n=max_leg_top_n,
+            require_wide_legs_on_dense=require_wide_legs_on_dense,
         )
+        if not constrained.empty:
+            eligible = constrained
+
+        eligible = add_rule_based_priority_features(eligible)
+
+        if selection_mode == "score":
+            eligible = eligible.sort_values(
+                [
+                    "auto_select_score",
+                    "buy_flag",
+                    "expected_value_ratio",
+                    "selected_probability_sum",
+                    "cost_yen",
+                ],
+                ascending=[False, False, False, False, True],
+            )
+        elif selection_mode == "two-stage":
+            if not 0.0 < top_probability_fraction <= 1.0:
+                raise ValueError("auto_select_top_probability_fraction は 0 より大きく 1 以下で指定してください")
+            eligible = eligible.sort_values(
+                ["selected_probability_sum", "auto_select_score", "cost_yen"],
+                ascending=[False, False, True],
+            ).reset_index(drop=True)
+            stage1_count = max(1, math.ceil(len(eligible) * top_probability_fraction))
+            eligible = eligible.head(stage1_count).copy()
+            eligible = eligible.sort_values(
+                [
+                    "ticket_count",
+                    "selected_probability_sum",
+                    "auto_select_score",
+                    "expected_value_ratio",
+                ],
+                ascending=[True, False, False, False],
+            )
+        elif selection_mode == "rule-based":
+            eligible = eligible.sort_values(
+                [
+                    "density_rank_1_top_n",
+                    "density_rank_2_top_n",
+                    "density_rank_3_top_n",
+                    "density_rank_4_top_n",
+                    "density_rank_5_top_n",
+                    "single_leg_count",
+                    "auto_select_score",
+                    "expected_value_ratio",
+                    "selected_probability_sum",
+                    "cost_yen",
+                ],
+                ascending=[False, False, False, False, False, False, False, False, False, True],
+            )
+        else:
+            raise ValueError(f"未対応の auto_select_mode です: {selection_mode}")
         selected_rows.append(eligible.head(1))
 
     auto_selected = pd.concat(selected_rows, ignore_index=True)
@@ -1131,11 +1379,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-min-expected-values", default=None)
     parser.add_argument("--max-probability-sum", type=float, default=0.0)
     parser.add_argument("--max-bet-amount", type=int, default=0)
+    parser.add_argument("--max-market-rank", type=int, default=10)
     parser.add_argument("--dynamic-topn", action="store_true")
     parser.add_argument("--dynamic-topn-threshold", type=float, default=0.05)
     parser.add_argument("--dynamic-topn-max", type=int, default=6)
     parser.add_argument("--selection-mode", choices=["late5", "last5", "jra_win5_rule"], default="late5")
     parser.add_argument("--auto-select-optimal-pattern", action="store_true")
+    parser.add_argument("--auto-select-mode", choices=["score", "two-stage", "rule-based"], default="rule-based")
+    parser.add_argument(
+        "--auto-select-score-mode",
+        choices=["expected_return", "expected_return_per_ticket", "expected_return_log_ticket_penalty"],
+        default="expected_return",
+    )
+    parser.add_argument("--auto-select-log-offset", type=float, default=5.0)
+    parser.add_argument("--auto-select-top-probability-fraction", type=float, default=0.2)
+    parser.add_argument("--auto-select-dense-odds-variance-threshold", type=float, default=10.0)
+    parser.add_argument("--auto-select-cliff-odds-ratio-threshold", type=float, default=1.5)
+    parser.add_argument("--auto-select-min-ticket-count", type=int, default=48)
+    parser.add_argument("--auto-select-max-ticket-count", type=int, default=128)
+    parser.add_argument("--auto-select-min-wide-legs", type=int, default=2)
+    parser.add_argument("--auto-select-max-wide-legs", type=int, default=2)
+    parser.add_argument("--auto-select-min-single-legs", type=int, default=1)
+    parser.add_argument("--auto-select-max-leg-topn", type=int, default=4)
+    parser.add_argument(
+        "--auto-select-require-wide-legs-on-dense",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--min-race-num", type=int, default=10)
     parser.add_argument("--required-races", type=int, default=5)
     parser.add_argument("--ticket-unit", type=int, default=100)
@@ -1229,6 +1499,7 @@ def main() -> None:
         payout_date_column=args.payout_date_column,
         payout_amount_column=args.payout_amount_column,
     )
+    max_market_rank = int(args.max_market_rank) if int(args.max_market_rank) > 0 else None
     win5_summary, win5_daily_results, grouped_day_count = evaluate_win5_patterns(
         scored_dataframe=scored,
         race_date_col=args.race_date_col,
@@ -1244,6 +1515,7 @@ def main() -> None:
         buy_expected_value_source=args.buy_expected_value_source,
         max_probability_sum=(float(args.max_probability_sum) if float(args.max_probability_sum) > 0.0 else None),
         max_bet_amount=(int(args.max_bet_amount) if int(args.max_bet_amount) > 0 else None),
+        max_market_rank=max_market_rank,
         dynamic_topn_enabled=bool(args.dynamic_topn),
         dynamic_topn_threshold=float(args.dynamic_topn_threshold),
         dynamic_topn_max=int(args.dynamic_topn_max),
@@ -1266,6 +1538,7 @@ def main() -> None:
     print(f"buy_expected_value_source={args.buy_expected_value_source}")
     print(f"max_probability_sum={float(args.max_probability_sum):.6f}")
     print(f"max_bet_amount={int(args.max_bet_amount)}")
+    print(f"max_market_rank={int(args.max_market_rank)}")
     print(f"dynamic_topn={int(bool(args.dynamic_topn))}")
     print(f"dynamic_topn_threshold={float(args.dynamic_topn_threshold):.4f}")
     print(f"dynamic_topn_max={int(args.dynamic_topn_max)}")
@@ -1285,6 +1558,7 @@ def main() -> None:
                     "min_expected_value": "{:.4f}".format,
                     "max_probability_sum": "{:.6f}".format,
                     "max_bet_amount": "{:.0f}".format,
+                    "max_market_rank": "{:.0f}".format,
                     "average_ticket_count": "{:.2f}".format,
                     "average_raw_ticket_count": "{:.2f}".format,
                     "average_cost_yen": "{:.2f}".format,
@@ -1313,7 +1587,22 @@ def main() -> None:
         print(win5_daily_results[best_key].head(args.preview_days).to_string(index=False))
 
         if args.auto_select_optimal_pattern:
-            auto_selected_daily = build_auto_selected_daily_patterns(win5_daily_results)
+            auto_selected_daily = build_auto_selected_daily_patterns(
+                win5_daily_results,
+                selection_mode=args.auto_select_mode,
+                score_mode=args.auto_select_score_mode,
+                log_offset=float(args.auto_select_log_offset),
+                top_probability_fraction=float(args.auto_select_top_probability_fraction),
+                dense_odds_variance_threshold=(float(args.auto_select_dense_odds_variance_threshold) if float(args.auto_select_dense_odds_variance_threshold) > 0.0 else None),
+                cliff_odds_ratio_threshold=(float(args.auto_select_cliff_odds_ratio_threshold) if float(args.auto_select_cliff_odds_ratio_threshold) > 0.0 else None),
+                min_ticket_count=(int(args.auto_select_min_ticket_count) if int(args.auto_select_min_ticket_count) > 0 else None),
+                max_ticket_count=(int(args.auto_select_max_ticket_count) if int(args.auto_select_max_ticket_count) > 0 else None),
+                min_wide_legs=(int(args.auto_select_min_wide_legs) if int(args.auto_select_min_wide_legs) > 0 else None),
+                max_wide_legs=(int(args.auto_select_max_wide_legs) if int(args.auto_select_max_wide_legs) > 0 else None),
+                min_single_legs=(int(args.auto_select_min_single_legs) if int(args.auto_select_min_single_legs) > 0 else None),
+                max_leg_top_n=(int(args.auto_select_max_leg_topn) if int(args.auto_select_max_leg_topn) > 0 else None),
+                require_wide_legs_on_dense=bool(args.auto_select_require_wide_legs_on_dense),
+            )
             if auto_selected_daily.empty:
                 print("auto_selected_optimal_patterns=利用可能な候補がありません")
             else:
@@ -1344,6 +1633,10 @@ def main() -> None:
                 )
                 print(
                     "auto_selected_summary="
+                    f"mode={args.auto_select_mode} "
+                    f"score_mode={args.auto_select_score_mode} "
+                    f"log_offset={float(args.auto_select_log_offset):.4f} "
+                    f"top_probability_fraction={float(args.auto_select_top_probability_fraction):.4f} "
                     f"day_count={len(auto_selected_daily)} "
                     f"hit_count={int(auto_selected_daily['all_hit'].sum())} "
                     f"bought_hit_count={int(auto_selected_daily['bought_hit'].sum())} "
@@ -1351,7 +1644,7 @@ def main() -> None:
                     f"total_expected_return_yen={float(auto_selected_daily['expected_return_yen'].sum()):.2f}"
                 )
 
-    print("note=buy_expected_value_source=estimated では feature_2 の単勝オッズ近似に本命サイド補正を掛けた推定配当を使います。--max-probability-sum で高確率すぎる日を見送り、--max-bet-amount で確率上位の買い目だけに物理的に絞れます")
+    print("note=buy_expected_value_source=estimated では feature_2 の単勝オッズ近似に本命サイド補正を掛けた推定配当を使います。--max-market-rank で市場人気の下限を切り、--max-probability-sum で高確率すぎる日を見送り、--max-bet-amount で確率上位の買い目だけに物理的に絞れます")
 
     preview_columns = ["race_id", args.race_date_col, "uma_ban", "target_class", "predicted_win_probability", "predicted_rank"]
     print("top_predictions_preview=")

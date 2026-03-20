@@ -185,7 +185,13 @@ def fetch_raw_training_data(
                 ur.ZogenFugo,
                 ur.ZogenSa,
                 ur.Ninki,
-                COALESCE(ot.TanOdds, ur.Odds) AS CurrentTanOdds,
+                COALESCE(
+                    CASE
+                        WHEN STR_TO_DATE(CONCAT(ur.Year, ur.MonthDay), '%Y%m%d') = CURDATE() THEN sot.TanOdds
+                        ELSE nott.TanOdds
+                    END,
+                    ur.Odds
+                ) AS CurrentTanOdds,
                 ur.HaronTimeL3,
                 ur.KakuteiJyuni,
                 ur.TimeDiff,
@@ -204,7 +210,15 @@ def fetch_raw_training_data(
                 LAG(ra.Kyori) OVER horse_window AS prev_distance_raw,
                 LAG(ra.TrackCD) OVER horse_window AS prev_track_cd,
                 LAG(ur.Ninki) OVER horse_window AS prev_popularity_raw,
-                LAG(COALESCE(ot.TanOdds, ur.Odds)) OVER horse_window AS prev_win_odds_raw,
+                LAG(
+                    COALESCE(
+                        CASE
+                            WHEN STR_TO_DATE(CONCAT(ur.Year, ur.MonthDay), '%Y%m%d') = CURDATE() THEN sot.TanOdds
+                            ELSE nott.TanOdds
+                        END,
+                        ur.Odds
+                    )
+                ) OVER horse_window AS prev_win_odds_raw,
                 LAG(ur.ZogenFugo) OVER horse_window AS prev_body_weight_diff_sign,
                 LAG(ur.ZogenSa) OVER horse_window AS prev_body_weight_diff_raw,
                 LAG(ur.Futan) OVER horse_window AS prev_carried_weight_raw,
@@ -213,13 +227,20 @@ def fetch_raw_training_data(
             FROM {raw_database}.N_UMA_RACE AS ur
             INNER JOIN target_horses AS th
                 ON ur.KettoNum = th.KettoNum
-            LEFT JOIN {raw_database}.N_ODDS_TANPUKU AS ot
-                ON ur.Year = ot.Year
-                AND ur.JyoCD = ot.JyoCD
-                AND ur.Kaiji = ot.Kaiji
-                AND ur.Nichiji = ot.Nichiji
-                AND ur.RaceNum = ot.RaceNum
-                AND ur.Umaban = ot.Umaban
+            LEFT JOIN {raw_database}.N_ODDS_TANPUKU AS nott
+                ON ur.Year = nott.Year
+                AND ur.JyoCD = nott.JyoCD
+                AND ur.Kaiji = nott.Kaiji
+                AND ur.Nichiji = nott.Nichiji
+                AND ur.RaceNum = nott.RaceNum
+                AND ur.Umaban = nott.Umaban
+            LEFT JOIN {raw_database}.S_ODDS_TANPUKU AS sot
+                ON ur.Year = sot.Year
+                AND ur.JyoCD = sot.JyoCD
+                AND ur.Kaiji = sot.Kaiji
+                AND ur.Nichiji = sot.Nichiji
+                AND ur.RaceNum = sot.RaceNum
+                AND ur.Umaban = sot.Umaban
             LEFT JOIN {raw_database}.N_RACE AS ra
                 ON ur.Year = ra.Year
                 AND ur.MonthDay = ra.MonthDay

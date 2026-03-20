@@ -187,8 +187,24 @@ class JravanDataFrameExtractor:
                     ELSE NULL
                 END AS body_weight_diff_kg,
                 CASE
-                    WHEN o.TanOdds REGEXP '^[0-9]{4}$' AND o.TanOdds NOT IN ('0000', '9999')
-                        THEN CAST(o.TanOdds AS UNSIGNED) / 10.0
+                    WHEN (
+                        CASE
+                            WHEN STR_TO_DATE(CONCAT(r.Year, r.MonthDay), '%Y%m%d') = CURDATE() THEN so.TanOdds
+                            ELSE no.TanOdds
+                        END
+                    ) REGEXP '^[0-9]{4}$'
+                    AND (
+                        CASE
+                            WHEN STR_TO_DATE(CONCAT(r.Year, r.MonthDay), '%Y%m%d') = CURDATE() THEN so.TanOdds
+                            ELSE no.TanOdds
+                        END
+                    ) NOT IN ('0000', '9999')
+                        THEN CAST(
+                            CASE
+                                WHEN STR_TO_DATE(CONCAT(r.Year, r.MonthDay), '%Y%m%d') = CURDATE() THEN so.TanOdds
+                                ELSE no.TanOdds
+                            END AS UNSIGNED
+                        ) / 10.0
                     ELSE NULL
                 END AS win_odds,
                 CASE
@@ -197,13 +213,20 @@ class JravanDataFrameExtractor:
                     ELSE NULL
                 END AS finish_position
             FROM N_UMA_RACE AS r
-            LEFT JOIN N_ODDS_TANPUKU AS o
-                ON r.Year = o.Year
-                AND r.JyoCD = o.JyoCD
-                AND r.Kaiji = o.Kaiji
-                AND r.Nichiji = o.Nichiji
-                AND r.RaceNum = o.RaceNum
-                AND r.Umaban = o.Umaban
+            LEFT JOIN N_ODDS_TANPUKU AS no
+                ON r.Year = no.Year
+                AND r.JyoCD = no.JyoCD
+                AND r.Kaiji = no.Kaiji
+                AND r.Nichiji = no.Nichiji
+                AND r.RaceNum = no.RaceNum
+                AND r.Umaban = no.Umaban
+            LEFT JOIN S_ODDS_TANPUKU AS so
+                ON r.Year = so.Year
+                AND r.JyoCD = so.JyoCD
+                AND r.Kaiji = so.Kaiji
+                AND r.Nichiji = so.Nichiji
+                AND r.RaceNum = so.RaceNum
+                AND r.Umaban = so.Umaban
             WHERE STR_TO_DATE(CONCAT(r.Year, r.MonthDay), '%Y%m%d') >= :cutoff_date
             ORDER BY race_date, jyo_cd, kaiji, nichiji, race_num, umaban
             """
